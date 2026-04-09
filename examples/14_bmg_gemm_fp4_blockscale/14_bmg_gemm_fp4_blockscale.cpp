@@ -504,7 +504,8 @@ struct ExampleRunner {
     CUTLASS_CHECK(gemm_ref.initialize(arguments, workspace.get()));
     CUTLASS_CHECK(gemm_ref.run());
 
-    // Compare with relaxed tolerance for FP4 (much lower precision than FP8)
+    // FP4 E2M1 has only ~1 bit of mantissa precision (values: 0, 0.5, 1, 1.5, 2, 3, 4, 6).
+    // This requires significantly relaxed tolerance compared to FP8/FP16 verification.
     ElementOutput const epsilon(5e-2f);
     ElementOutput const non_zero_floor(1e-4f);
     bool passed = cutlass::reference::device::BlockCompareRelativelyEqual(
@@ -739,7 +740,7 @@ int launcher(Options& options)
   // convert_FP8_to_FP16 in the mainloop.
   //
   using MmaType = cutlass::half_t;
-  using QuantType = cutlass::float_e4m3_t;  // TODO: Replace with float_e2m1_t when mainloop supports it
+  using QuantType = cutlass::float_e4m3_t;  // E4M3 used as packed byte container; see design note above
 
   using ElementAccumulator = float;
   using ElementComputeEpilogue = float;
