@@ -39,9 +39,9 @@
 
   The implementation reuses the existing FP8 scaling mainloop infrastructure
   (MainloopIntelXeXMX16FP8Scaling) from SYCL-TLA. The key insight is that:
-    - FP4 data is loaded via 8-bit load descriptors (each byte packs 2 FP4 values)
-    - In registers, each FP4 value is unpacked and converted to half_t (FP16)
-    - Per-block scale factors are loaded and multiplied element-wise
+    - FP4 values are stored as E4M3 (float_e4m3_t) at one byte per value
+    - All E2M1 values are exactly representable in E4M3 (lossless encoding)
+    - The FP8 scaling mainloop converts E4M3→FP16 and applies per-block scales
     - The MMA then operates on the scaled FP16 values
 
   Block-Wise FP4 GEMM Modes:
@@ -67,17 +67,16 @@
 
   TODO / Known Limitations:
     - The FP4 conversion path reuses the FP8 scaling mainloop. This works because
-      the mainloop's transform functions handle element-wise conversion and scaling,
-      but a dedicated FP4 mainloop could be more efficient by:
+      all E2M1 values are exactly representable in E4M3, and the mainloop's
+      E4M3→FP16 conversion followed by per-block scaling is numerically correct.
+      A dedicated FP4 mainloop could be more efficient by:
         * Using native 4-bit DPAS MMA atoms (XE_DPAS_TT with u4/s4) directly
           instead of widening to FP16 first
-        * Implementing tighter packing in the copy descriptors
-    - The FP8 mainloop's static_assert for float_e4m3_t/float_e5m2_t must be
-      relaxed to also accept float_e2m1_t. Since we cannot modify library headers
-      in this example, we encode FP4 data as uint8_t (two FP4 values packed per
-      byte) and provide a custom conversion step. See convert_fp4_to_fp16().
+        * Implementing true 4-bit packing (2 values per byte) with custom unpack
+    - Storage is at FP8 granularity (1 byte per value) rather than true 4-bit
+      packing. A production implementation would pack 2 FP4 values per byte.
     - No FP4 → FP16 hardware conversion intrinsic exists on Intel Xe; conversion
-      uses a software lookup table.
+      uses the E4M3 → FP16 path (exact for E2M1 values).
     - Zero-point support is omitted for FP4 as the E2M1 format is symmetric
       around zero (no bias term needed for typical block-scaled FP4 schemes).
 
@@ -125,28 +124,15 @@ enum GemmMode {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-// FP4 (E2M1) lookup table: maps 4-bit encoding → float value
+// FP4 (E2M1) representable values.
 // E2M1 encoding: [sign(1)][exp(2)][mantissa(1)]
 // Values: 0, 0.5, 1, 1.5, 2, 3, 4, 6  (and their negatives)
-static constexpr float kFP4E2M1LUT[16] = {
+// All of these are exactly representable in E4M3 (FP8), so we store each
+// FP4 value as one E4M3 byte for compatibility with the FP8 scaling mainloop.
+static constexpr float kFP4E2M1Values[16] = {
    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,   // positive
   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f    // negative
 };
-
-/// Host-side: Pack two float_e2m1_t values into one byte.
-inline uint8_t pack_fp4_pair(cutlass::float_e2m1_t lo, cutlass::float_e2m1_t hi) {
-  uint8_t lo_bits = reinterpret_cast<const uint8_t&>(lo) & 0x0F;
-  uint8_t hi_bits = reinterpret_cast<const uint8_t&>(hi) & 0x0F;
-  return static_cast<uint8_t>(lo_bits | (hi_bits << 4));
-}
-
-/// Host-side: Unpack one byte into two float values (for reference computation).
-inline void unpack_fp4_pair(uint8_t packed, float& lo_val, float& hi_val) {
-  uint8_t lo_bits = packed & 0x0F;
-  uint8_t hi_bits = (packed >> 4) & 0x0F;
-  lo_val = kFP4E2M1LUT[lo_bits];
-  hi_val = kFP4E2M1LUT[hi_bits];
-}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -215,147 +201,12 @@ struct Options {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Host-side reference implementation for FP4 block-scaled GEMM.
-//
-// This performs: D = alpha * (dequant(A) * dequant(B)) + beta * C
-// where dequant(X)[m][k] = fp4_to_fp16(X_packed[m][k]) * scale_X[m][k/group_size]
-//
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Host-side reference: dequantize packed FP4 data into float buffer.
-/// A is RowMajor [M, K], packed as [M, K/2] bytes.
-static void host_dequantize_fp4(
-    const uint8_t* packed_data,   // [rows, cols/2] packed FP4
-    const cutlass::half_t* scales, // [rows, scale_k] MN-major scale factors
-    float* output,                // [rows, cols] output in float
-    int rows, int cols, int group_size, int scale_k, int batches,
-    bool apply_scales)
-{
-  for (int b = 0; b < batches; ++b) {
-    for (int row = 0; row < rows; ++row) {
-      for (int col = 0; col < cols; col += 2) {
-        int packed_idx = b * rows * (cols / 2) + row * (cols / 2) + col / 2;
-        float lo_val, hi_val;
-        unpack_fp4_pair(packed_data[packed_idx], lo_val, hi_val);
-
-        if (apply_scales) {
-          int scale_col = col / group_size;
-          int scale_idx = b * rows * scale_k + row * scale_k + scale_col;
-          float scale = static_cast<float>(scales[scale_idx]);
-          lo_val *= scale;
-          hi_val *= scale;
-        }
-
-        int out_idx = b * rows * cols + row * cols + col;
-        output[out_idx] = lo_val;
-        if (col + 1 < cols) {
-          output[out_idx + 1] = hi_val;
-        }
-      }
-    }
-  }
-}
-
-/// Host-side reference GEMM: C = alpha * A * B^T + beta * C
-/// A is [M, K] row-major, B is [N, K] row-major (so B^T is [K, N]).
-/// Actually for CUTLASS convention with RowMajor B: B[N][K] and the GEMM is A[M][K] * B[N][K]^T.
-/// But our GEMM computes A * B where A=[M,K] RowMajor, B=[N,K] RowMajor
-/// This means the math is: D[m][n] = sum_k( A[m][k] * B[n][k] )
-static void host_gemm_ref(
-    const float* A,      // [M, K] row-major
-    const float* B,      // [N, K] row-major (transposed in GEMM: B[n][k])
-    const float* C,      // [M, N] row-major
-    float* D,            // [M, N] row-major
-    int M, int N, int K, int batches,
-    float alpha, float beta)
-{
-  for (int b = 0; b < batches; ++b) {
-    for (int m = 0; m < M; ++m) {
-      for (int n = 0; n < N; ++n) {
-        float acc = 0.0f;
-        for (int k = 0; k < K; ++k) {
-          float a_val = A[b * M * K + m * K + k];
-          float b_val = B[b * N * K + n * K + k];
-          acc += a_val * b_val;
-        }
-        int idx = b * M * N + m * N + n;
-        D[idx] = alpha * acc + beta * C[idx];
-      }
-    }
-  }
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// Device-side SYCL kernel for FP4→FP16 conversion (for the CUTLASS reference GEMM path).
-//
-// Since the FP8 scaling mainloop expects uint8_t data that is later converted
-// to FP16 inside the mainloop, the "main" GEMM kernel handles conversion
-// internally. For the reference GEMM, we need pre-dequantized FP16 data.
-//
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <class> class dequant_fp4_kernel_name;
-
-/// Device kernel: unpack FP4 bytes → half_t, optionally apply scales.
-/// Each work-item processes one byte (2 FP4 values).
-template <typename Runner>
-void device_dequant_fp4(
-    const uint8_t* packed_src,      // [rows * cols/2 * batches]
-    cutlass::half_t* dst,           // [rows * cols * batches]
-    const cutlass::half_t* scales,  // [rows * scale_k * batches] or nullptr
-    int rows, int cols, int group_size, int scale_k, int batches,
-    bool apply_scales)
-{
-  size_t num_bytes = static_cast<size_t>(rows) * (cols / 2) * batches;
-
-  compat::get_default_queue().parallel_for<dequant_fp4_kernel_name<Runner>>(
-    num_bytes,
-    [=](auto idx) {
-      int b = idx / (rows * (cols / 2));
-      int rem = idx % (rows * (cols / 2));
-      int row = rem / (cols / 2);
-      int byte_col = rem % (cols / 2);
-
-      uint8_t packed = packed_src[idx];
-      uint8_t lo_bits = packed & 0x0F;
-      uint8_t hi_bits = (packed >> 4) & 0x0F;
-
-      // E2M1 LUT (device-side, inline)
-      // Values: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (positive)
-      //        -0, -0.5, -1, -1.5, -2, -3, -4, -6 (negative)
-      constexpr float lut[16] = {
-         0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-      };
-
-      float lo_f = lut[lo_bits];
-      float hi_f = lut[hi_bits];
-
-      if (apply_scales) {
-        int col0 = byte_col * 2;
-        int scale_col = col0 / group_size;
-        int scale_idx = b * rows * scale_k + row * scale_k + scale_col;
-        float s = static_cast<float>(scales[scale_idx]);
-        lo_f *= s;
-        hi_f *= s;
-      }
-
-      int out_idx = b * rows * cols + row * cols + byte_col * 2;
-      dst[out_idx]     = cutlass::half_t(lo_f);
-      dst[out_idx + 1] = cutlass::half_t(hi_f);
-    }).wait();
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-//
 // ExampleRunner: Orchestrates initialization, GEMM execution, and verification.
 //
-// Design note: The FP4 data is stored packed (2 values per byte) in uint8_t
-// buffers. This matches how the FP8 scaling mainloop loads data through
-// XE_2D_U8x32x32_LD_N copy descriptors. The mainloop loads bytes, then
-// transforms them in registers. For FP4, we reuse this same path but with
-// a custom conversion step.
+// Design note: FP4 (E2M1) values are stored as E4M3 (float_e4m3_t), one byte
+// per value. This is lossless since E4M3 can represent all E2M1 values exactly.
+// The FP8 scaling mainloop (xe_mma_fp8_scaling.hpp) loads E4M3 bytes via
+// XE_2D_U8x32x32_LD_N, converts to FP16, and applies per-block scales.
 //
 // The tuple-based ElementA/ElementB mechanism from xe_mma_fp8_scaling.hpp is
 // used to attach scale factor metadata to each operand.
@@ -382,6 +233,8 @@ struct ExampleRunner {
   using ElementB = typename Gemm::ElementB;
   using ElementAcc = typename Gemm::ElementAccumulator;
   using ElementMMA = typename CollectiveMainloop::ElementMMA;
+
+  using ElementQuant = ElementA;
 
   using ElementScaleA = typename CollectiveMainloop::NonVoidElementScaleA;
   using ElementScaleB = typename CollectiveMainloop::NonVoidElementScaleB;
@@ -417,17 +270,15 @@ struct ExampleRunner {
 
   uint64_t seed = 42;
 
-  // Packed FP4 data (2 values per byte)
-  cutlass::DeviceAllocation<uint8_t> block_A_packed;  // [M * K/2 * L]
-  cutlass::DeviceAllocation<uint8_t> block_B_packed;  // [N * K/2 * L]
-
-  // Dequantized FP16 data for reference GEMM
-  cutlass::DeviceAllocation<cutlass::half_t> block_A_dq;  // [M * K * L]
-  cutlass::DeviceAllocation<cutlass::half_t> block_B_dq;  // [N * K * L]
-
+  cutlass::DeviceAllocation<ElementA> block_A;
+  cutlass::DeviceAllocation<ElementB> block_B;
+  cutlass::DeviceAllocation<ElementMMA> block_A_dq;  // Dequantized copy of A for validation
+  cutlass::DeviceAllocation<ElementMMA> block_B_dq;  // Dequantized copy of B for validation
   cutlass::DeviceAllocation<ElementC> block_C;
   cutlass::DeviceAllocation<ElementScaleA> block_scaleA;
   cutlass::DeviceAllocation<ElementScaleB> block_scaleB;
+  cutlass::DeviceAllocation<ElementZeroA> block_zeroA;
+  cutlass::DeviceAllocation<ElementZeroB> block_zeroB;
   cutlass::DeviceAllocation<ElementOutput> block_D;
   cutlass::DeviceAllocation<ElementOutput> block_ref_D;
 
@@ -538,28 +389,38 @@ struct ExampleRunner {
     return true;
   }
 
-  /// Generate random FP4 values packed into bytes.
-  /// Each byte contains two FP4 (E2M1) values in the low and high nibbles.
-  void initialize_packed_fp4(
-    cutlass::DeviceAllocation<uint8_t>& block_packed,
-    size_t num_fp4_elements,
+  /// Initialize zero-point buffers (always 0 for symmetric FP4 E2M1 format).
+  template <class Element>
+  bool initialize_zero(
+    cutlass::DeviceAllocation<Element>& block,
+    Options const& options) {
+
+    std::vector<Element> stage(block.size(), Element(0.0f));
+    block.copy_from_host(stage.data());
+    return true;
+  }
+
+  /// Generate random FP4-range values stored as E4M3 (one byte per value).
+  /// Values are drawn from the FP4 E2M1 representable set:
+  ///   {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}
+  /// Each value is losslessly encoded as float_e4m3_t since E4M3 ⊇ E2M1.
+  void initialize_fp4_as_e4m3(
+    cutlass::DeviceAllocation<cutlass::float_e4m3_t>& block,
+    size_t num_elements,
     uint64_t rng_seed)
   {
-    size_t num_bytes = num_fp4_elements / 2;
-    std::vector<uint8_t> host_data(num_bytes);
+    std::vector<cutlass::float_e4m3_t> host_data(num_elements);
 
     std::mt19937 rng(static_cast<unsigned>(rng_seed));
-    // FP4 E2M1 has 16 possible encodings (4 bits). We generate random 4-bit values.
     std::uniform_int_distribution<int> dist(0, 15);
 
-    for (size_t i = 0; i < num_bytes; ++i) {
-      uint8_t lo = static_cast<uint8_t>(dist(rng));
-      uint8_t hi = static_cast<uint8_t>(dist(rng));
-      host_data[i] = static_cast<uint8_t>(lo | (hi << 4));
+    for (size_t i = 0; i < num_elements; ++i) {
+      float val = kFP4E2M1Values[dist(rng)];
+      host_data[i] = cutlass::float_e4m3_t(val);
     }
 
-    block_packed.reset(num_bytes);
-    block_packed.copy_from_host(host_data.data());
+    block.reset(num_elements);
+    block.copy_from_host(host_data.data());
   }
 
   /// Initialize all operands for the GEMM.
@@ -570,8 +431,8 @@ struct ExampleRunner {
     auto shape_A = cute::make_shape(M, K, L);
     auto shape_B = cute::make_shape(N, K, L);
     auto shape_CD = cute::make_shape(M, N, L);
-    auto shape_scaleA = cute::make_shape(M, scale_k, L);
-    auto shape_scaleB = cute::make_shape(N, scale_k, L);
+    auto shape_scaleA = cute::make_shape(options.m, scale_k, L);
+    auto shape_scaleB = cute::make_shape(options.n, scale_k, L);
 
     stride_A = cutlass::make_cute_packed_stride(StrideA{}, shape_A);
     stride_B = cutlass::make_cute_packed_stride(StrideB{}, shape_B);
@@ -582,11 +443,14 @@ struct ExampleRunner {
     stride_ZA = cutlass::make_cute_packed_stride(StrideZeroA{}, shape_scaleA);
     stride_ZB = cutlass::make_cute_packed_stride(StrideZeroB{}, shape_scaleB);
 
-    // Allocate packed FP4 buffers
+    // Allocate operand buffers (one E4M3 byte per logical FP4 element)
     size_t num_A = static_cast<size_t>(M) * K * L;
     size_t num_B = static_cast<size_t>(N) * K * L;
-    initialize_packed_fp4(block_A_packed, num_A, seed + 2023);
-    initialize_packed_fp4(block_B_packed, num_B, seed + 2022);
+
+    block_A.reset(num_A);
+    block_B.reset(num_B);
+    initialize_fp4_as_e4m3(block_A, num_A, seed + 2023);
+    initialize_fp4_as_e4m3(block_B, num_B, seed + 2022);
 
     // Allocate dequantized FP16 buffers (for reference GEMM)
     block_A_dq.reset(num_A);
@@ -598,23 +462,33 @@ struct ExampleRunner {
     block_ref_D.reset(static_cast<size_t>(M) * N * L);
 
     // Initialize C with random data
-    cutlass::reference::device::BlockFillRandomUniform(
-        block_C.get(), block_C.size(), seed + 2021, ElementC(1.0f), ElementC(-1.0f));
+    initialize_block(block_C, seed + 2021);
 
-    // Allocate and fill scale factors
-    block_scaleA.reset(static_cast<size_t>(M) * scale_k * L);
-    block_scaleB.reset(static_cast<size_t>(N) * scale_k * L);
+    // Allocate and fill scale and zero buffers
+    block_scaleA.reset(static_cast<size_t>(scale_k) * L * M);
+    block_scaleB.reset(static_cast<size_t>(scale_k) * L * N);
+    block_zeroA.reset(static_cast<size_t>(scale_k) * L * M);
+    block_zeroB.reset(static_cast<size_t>(scale_k) * L * N);
+
     initialize_scale(block_scaleA, options);
+    initialize_zero(block_zeroA, options);
     initialize_scale(block_scaleB, options);
+    initialize_zero(block_zeroB, options);
 
-    // Dequantize FP4 → FP16 for reference path (applies scales if mode == ConvertAndScale)
-    bool apply_scales = (options.mode == GemmMode::ConvertAndScale);
-    device_dequant_fp4<ExampleRunner>(
-        block_A_packed.get(), block_A_dq.get(), block_scaleA.get(),
-        M, K, options.g, scale_k, L, apply_scales);
-    device_dequant_fp4<ExampleRunner>(
-        block_B_packed.get(), block_B_dq.get(), block_scaleB.get(),
-        N, K, options.g, scale_k, L, apply_scales);
+    // Dequantize E4M3 → FP16 with scales for reference GEMM.
+    // This matches the kernel's path: load E4M3 byte → convert to FP16 → multiply by scale.
+    // cutlass::dequantize handles both conversion and scaling in one step.
+    auto layout_A = make_layout(shape_A, stride_A);
+    auto layout_B = make_layout(shape_B, stride_B);
+    auto layout_scaleA = make_layout(shape_scaleA, stride_SA);
+    auto layout_scaleB = make_layout(shape_scaleB, stride_SB);
+
+    cutlass::dequantize(block_A_dq.get(), block_A.get(), layout_A,
+                        block_scaleA.get(), block_zeroA.get(), layout_scaleA, layout_scaleA,
+                        options.g);
+    cutlass::dequantize(block_B_dq.get(), block_B.get(), layout_B,
+                        block_scaleB.get(), block_zeroB.get(), layout_scaleB, layout_scaleB,
+                        options.g);
   }
 
   cutlass::Status run(const Options& options, const cutlass::KernelHardwareInfo& hw_info) {
@@ -624,22 +498,15 @@ struct ExampleRunner {
 
     //
     // Configure the main GEMM arguments.
-    //
-    // The packed FP4 data (uint8_t*) is passed as the A/B operand pointers.
-    // The stride is computed based on the *logical* FP4 element layout, but
-    // the copy descriptors load bytes (2 FP4 values per byte).
-    //
-    // NOTE: The FP8 scaling mainloop expects the data pointer type to match
-    // the ElementA/B extracted from the tuple. Since we pack FP4 as uint8_t
-    // (matching the FP8 byte-level load), this is compatible.
+    // FP4-range data is stored as E4M3 (one byte per value). The FP8 scaling
+    // mainloop loads bytes, converts E4M3→FP16, and applies per-block scales.
     //
     typename Gemm::GemmKernel::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
       problem_size,
-      {reinterpret_cast<const ElementA*>(block_A_packed.get()), stride_A,
-       reinterpret_cast<const ElementB*>(block_B_packed.get()), stride_B,
+      {block_A.get(), stride_A, block_B.get(), stride_B,
        block_scaleA.get(), stride_SA, block_scaleB.get(), stride_SB,
-       nullptr, stride_ZA, nullptr, stride_ZB,
+       nullptr, stride_SA, nullptr, stride_SB,
        options.g},
       {{options.alpha, options.beta}, block_C.get(), stride_C, block_D.get(), stride_D},
       hw_info
@@ -697,20 +564,18 @@ struct ExampleRunner {
 // Launcher: Configures the CUTLASS GEMM kernel types and dispatches.
 //
 // Architecture mapping:
-//   FP4 packed as uint8_t → loaded via XE_2D_U8x32x32_LD_N (same as FP8)
+//   FP4 values stored as E4M3 → loaded via XE_2D_U8x32x32_LD_N (same as FP8)
 //   Converted to half_t in registers → MMA via XE_8x16x16_F32F16F16F32_TT
 //   Scale factors in half_t → loaded via scale_zero_copy_traits
 //
-// We use float_e4m3_t as the "logical" element type because:
-//   1. It is 8-bit, matching our packed byte representation
+// We use float_e4m3_t as the element type because:
+//   1. All E2M1 values are exactly representable in E4M3 (lossless)
 //   2. The FP8 scaling mainloop is specialized for float_e4m3_t / float_e5m2_t
-//   3. The actual FP4→FP16 conversion happens in the transform functions
+//   3. The mainloop converts E4M3→FP16 and applies per-block scales correctly
 //
 // TODO: A cleaner approach would be to add a dedicated dispatch policy
-//       (e.g., MainloopIntelXeXMX16FP4Scaling) and a corresponding
-//       CollectiveMma specialization that natively understands FP4 packing.
-//       This would avoid the float_e4m3_t aliasing and enable optimizations
-//       like using 4-bit DPAS atoms directly.
+//       (e.g., MainloopIntelXeXMX16FP4Scaling) with true 4-bit packing
+//       and native DPAS u4/s4 support.
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -721,26 +586,12 @@ int launcher(Options& options)
 
   // --- Type definitions ---
   //
-  // We encode FP4 as float_e4m3_t (8-bit) for compatibility with the existing
-  // FP8 scaling mainloop. Each byte actually contains 2 packed FP4 values.
-  // The mainloop's transform_A / transform_B functions handle the FP8→FP16
-  // conversion; for true FP4 we rely on the fact that the packed byte
-  // representation, when interpreted as E4M3, produces values that are then
-  // scaled by the block scale factors. The reference path uses the exact FP4
-  // decode for verification.
-  //
-  // NOTE: This is a pragmatic reuse of existing infrastructure. The numerical
-  // results will match the reference because:
-  //   (a) Both paths start from the same packed byte data
-  //   (b) The reference path does exact FP4 decode + scale
-  //   (c) The kernel path does FP8-as-FP4 decode + scale
-  //   (d) The tolerance is set wide enough to accommodate the approximation
-  //
-  // For production use, a dedicated FP4 conversion function should replace
-  // convert_FP8_to_FP16 in the mainloop.
+  // FP4 values from the E2M1 representable set are stored as E4M3 (one byte
+  // per value). This is lossless since E4M3 ⊇ E2M1. The FP8 scaling mainloop
+  // handles E4M3→FP16 conversion and per-block scale multiplication.
   //
   using MmaType = cutlass::half_t;
-  using QuantType = cutlass::float_e4m3_t;  // E4M3 used as packed byte container; see design note above
+  using QuantType = cutlass::float_e4m3_t;
 
   using ElementAccumulator = float;
   using ElementComputeEpilogue = float;
@@ -866,8 +717,8 @@ int main(int argc, const char** argv) {
   }
 
   // Validate constraints
-  if (options.k % 2 != 0) {
-    std::cerr << "K must be even for FP4 packing (2 values per byte)." << std::endl;
+  if (options.k % 32 != 0) {
+    std::cerr << "K must be a multiple of 32 (K-tile size)." << std::endl;
     return -1;
   }
   if (options.g % 32 != 0) {
