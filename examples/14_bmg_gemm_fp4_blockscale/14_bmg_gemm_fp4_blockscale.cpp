@@ -50,6 +50,9 @@
 
   - ConvertOnly:     FP4 values are converted to FP16 before MMA (no scaling).
                      Useful as a baseline or when data is already in correct range.
+                     Implemented by running the ConvertAndScale kernel with all
+                     scale factors set to 1.0 (avoids a separate kernel that
+                     causes excessive register spilling on BMG targets).
 
   - ConvertAndScale: FP4 values are converted to FP16, then multiplied by
                      per-block scale factors. This is the "true" block-wise
@@ -443,12 +446,10 @@ struct ExampleRunner {
     stride_ZA = cutlass::make_cute_packed_stride(StrideZeroA{}, shape_scaleA);
     stride_ZB = cutlass::make_cute_packed_stride(StrideZeroB{}, shape_scaleB);
 
-    // Allocate operand buffers (one E4M3 byte per logical FP4 element)
+    // Allocate and fill operand buffers (one E4M3 byte per logical FP4 element)
     size_t num_A = static_cast<size_t>(M) * K * L;
     size_t num_B = static_cast<size_t>(N) * K * L;
 
-    block_A.reset(num_A);
-    block_B.reset(num_B);
     initialize_fp4_as_e4m3(block_A, num_A, seed + 2023);
     initialize_fp4_as_e4m3(block_B, num_B, seed + 2022);
 
@@ -642,59 +643,41 @@ int launcher(Options& options)
           void, void>;
 
   //
-  // Mode dispatch: ConvertOnly vs ConvertAndScale
+  // Single kernel instantiation: ConvertAndScale mainloop handles both modes.
+  // ConvertOnly is achieved by passing scales=1.0 (set in initialize_scale()).
+  // This avoids a separate 1-element-tuple kernel instantiation that causes
+  // excessive register spilling (227 spills) and undefined prefetch intrinsics
+  // on BMG targets.
   //
 
   if (options.mode == GemmMode::ConvertOnly) {
-    std::cout << "Running FP4 Block-Scaled GEMM in ConvertOnly mode." << std::endl;
-
-    using ConvertOnlyCollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-            GEMMDispatchPolicy,
-            TileShape,
-            cute::tuple<ElementInputA>,
-            cutlass::gemm::TagToStrideA_t<LayoutA>,
-            cute::tuple<ElementInputB>,
-            cutlass::gemm::TagToStrideB_t<LayoutB>,
-            TiledMma,
-            GmemTiledCopyA, void, void, cute::identity,
-            GmemTiledCopyB, void, void, cute::identity
-    >;
-
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int, int, int, int>,
-      ConvertOnlyCollectiveMainloop,
-      CollectiveEpilogue
-    >;
-    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-    CUTLASS_CHECK(ExampleRunner<Gemm>{}.run(options, hw_info));
-
+    std::cout << "Running FP4 Block-Scaled GEMM in ConvertOnly mode (scales=1.0)." << std::endl;
   } else if (options.mode == GemmMode::ConvertAndScale) {
     std::cout << "Running FP4 Block-Scaled GEMM in ConvertAndScale mode." << std::endl;
-
-    using ConvertAndScaleCollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-            GEMMDispatchPolicy,
-            TileShape,
-            cute::tuple<ElementInputA, ElementScale, StrideScale>,
-            cutlass::gemm::TagToStrideA_t<LayoutA>,
-            cute::tuple<ElementInputB, ElementScale, StrideScale>,
-            cutlass::gemm::TagToStrideB_t<LayoutB>,
-            TiledMma,
-            GmemTiledCopyA, void, void, cute::identity,
-            GmemTiledCopyB, void, void, cute::identity
-    >;
-
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int, int, int, int>,
-      ConvertAndScaleCollectiveMainloop,
-      CollectiveEpilogue
-    >;
-    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-    CUTLASS_CHECK(ExampleRunner<Gemm>{}.run(options, hw_info));
-
   } else {
     std::cerr << "Unknown mode: " << options.mode << ". Use 0 (ConvertOnly) or 1 (ConvertAndScale)." << std::endl;
     return -1;
   }
+
+  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+          GEMMDispatchPolicy,
+          TileShape,
+          cute::tuple<ElementInputA, ElementScale, StrideScale>,
+          cutlass::gemm::TagToStrideA_t<LayoutA>,
+          cute::tuple<ElementInputB, ElementScale, StrideScale>,
+          cutlass::gemm::TagToStrideB_t<LayoutB>,
+          TiledMma,
+          GmemTiledCopyA, void, void, cute::identity,
+          GmemTiledCopyB, void, void, cute::identity
+  >;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CollectiveMainloop,
+    CollectiveEpilogue
+  >;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  CUTLASS_CHECK(ExampleRunner<Gemm>{}.run(options, hw_info));
 
   return 0;
 }
